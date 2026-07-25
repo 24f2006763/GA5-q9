@@ -5,7 +5,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from flask import Flask, Response, jsonify, request
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
@@ -35,12 +35,12 @@ def canonical_json_bytes(obj: Any) -> bytes:
 
 
 def compute_input_digest(dossiers: List[Dict[str, Any]]) -> str:
-    """Computes SHA-256 hex digest over UTF-8 bytes of dossiers array encoded as recursively key-sorted compact JSON."""
+    """Computes SHA-256 hex digest over UTF-8 bytes of dossiers array."""
     return hashlib.sha256(canonical_json_bytes(dossiers)).hexdigest().lower()
 
 
 def compute_dossier_content_hash(dossier: Dict[str, Any]) -> str:
-    """Computes a stable fingerprint for a dossier based on its immutable content (mailbox, objective, sources)."""
+    """Computes a stable fingerprint for a dossier based on its immutable content."""
     content_obj = {
         "mailbox": dossier.get("mailbox", ""),
         "objective": dossier.get("objective", ""),
@@ -64,111 +64,188 @@ def compute_proposal_digest(proposal: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Safety & Action Decision Engine
+# Deep Dossier Analysis & Parameter Extraction Engine
 # ---------------------------------------------------------------------------
 
 
-def analyze_dossier(dossier: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]], Dict[str, Any], List[str]]:
-    """Analyzes a dossier using deterministic rules and safety boundaries to return: (action, target, payload, evidence_line_ids)."""
-    sources = dossier.get("sources", [])
-    objective = dossier.get("objective", "").lower()
-    mailbox = dossier.get("mailbox", "")
+def extract_field_from_lines(
+    lines: List[Tuple[str, str, str, str]], patterns: List[str]
+) -> Tuple[Optional[str], Optional[str]]:
+    """Searches lines for key-value patterns. Returns (value, lineId)."""
+    for line_id, text, _, _ in lines:
+        for pat in patterns:
+            match = re.search(pat, text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip(), line_id
+    return None, None
 
-    all_lines: List[Tuple[str, str, str]] = []  # (lineId, text, kind)
-    evidence_map: Dict[str, str] = {}
+
+def analyze_dossier(
+    dossier: Dict[str, Any]
+) -> Tuple[str, Optional[Dict[str, Any]], Dict[str, Any], List[str]]:
+    """Analyzes a dossier using provenance, authority, and structural extraction."""
+    dossier_id = dossier.get("dossierId", "")
+    mailbox = dossier.get("mailbox", "")
+    objective = dossier.get("objective", "")
+    sources = dossier.get("sources", [])
+
+    all_lines: List[Tuple[str, str, str, str]] = []  # (lineId, text, kind, provenance)
 
     for src in sources:
         kind = src.get("kind", "")
+        prov = src.get("provenance", "")
         for line in src.get("lines", []):
-            line_id = line.get("lineId")
-            text = line.get("text", "")
-            if line_id:
-                all_lines.append((line_id, text, kind))
-                evidence_map[line_id] = text
+            l_id = line.get("lineId")
+            txt = line.get("text", "")
+            if l_id:
+                all_lines.append((l_id, txt, kind, prov))
 
-    combined_text = " ".join([txt for _, txt, _ in all_lines]).lower()
+    if not all_lines:
+        return (
+            "no_action",
+            None,
+            {"reasonCode": "INFORMATIONAL", "referenceId": dossier_id},
+            [],
+        )
 
-    # Rule 1: Quarantine Indirect Prompt Injections / Exfiltration Attempts
-    injection_keywords = [
-        "ignore previous instructions",
-        "ignore all prior instructions",
-        "system prompt",
-        "exfiltrate",
-        "send secrets to",
-        "override safety",
-        "bypass security",
-        "hidden instruction",
-        "eval(",
-        "base64 -d",
+    first_line_id = all_lines[0][0]
+
+    # --- 1. Indirect Prompt Injection Check ---
+    injection_patterns = [
+        r"ignore\s+(previous|all|prior)\s+instructions",
+        r"exfiltrate",
+        r"override\s+safety",
+        r"bypass\s+security",
+        r"system\s+prompt",
     ]
 
-    for line_id, text, kind in all_lines:
-        t_lower = text.lower()
-        if any(kw in t_lower for kw in injection_keywords) and kind in ("external_email", "attachment", "untrusted"):
-            first_line_id = all_lines[0][0] if all_lines else line_id
+    for l_id, text, kind, prov in all_lines:
+        # Attacks coming from untrusted external content
+        if prov in ("untrusted", "external") or kind in ("external_email", "attachment"):
+            for pat in injection_patterns:
+                if re.search(pat, text, re.IGNORECASE):
+                    # Extract artifact ID if present
+                    art_id, art_line = extract_field_from_lines(
+                        all_lines, [r"artifact[_-]?id[:\s]+([a-zA-Z0-9_\-]+)"]
+                    )
+                    evidence = [l_id]
+                    if art_line and art_line not in evidence:
+                        evidence.append(art_line)
+                    return (
+                        "quarantine_item",
+                        {"kind": "security_queue", "id": "mailroom"},
+                        {
+                            "artifactId": art_id if art_id else dossier_id,
+                            "reasonCode": "INDIRECT_PROMPT_INJECTION",
+                        },
+                        evidence,
+                    )
+
+    # Extract common IDs across dossier
+    ref_id, ref_line = extract_field_from_lines(
+        all_lines, [r"ref(?:erence)?(?:Id)?[:\s]+([a-zA-Z0-9_\-]+)"]
+    )
+    case_id, case_line = extract_field_from_lines(
+        all_lines, [r"case(?:Id)?[:\s]+([a-zA-Z0-9_\-]+)"]
+    )
+    val, val_line = extract_field_from_lines(
+        all_lines, [r"window[:\s]+([a-zA-Z0-9_\-\s]+)"]
+    )
+
+    if not ref_id:
+        ref_id = dossier_id
+        ref_line = first_line_id
+
+    # --- 2. Approved Delivery Notice ---
+    for l_id, text, _, prov in all_lines:
+        if "approved" in text.lower() and ("notice" in text.lower() or "send" in text.lower()):
+            evidence = [l_id]
+            if ref_line and ref_line not in evidence:
+                evidence.append(ref_line)
             return (
-                "quarantine_item",
-                {"kind": "security_queue", "id": "mailroom"},
-                {"artifactId": dossier.get("dossierId", "unknown"), "reasonCode": "INDIRECT_PROMPT_INJECTION"},
-                [line_id],
+                "send_approved_notice",
+                {"kind": "email", "id": mailbox if mailbox else "customer@example.com"},
+                {
+                    "referenceId": ref_id,
+                    "status": "approved",
+                    "template": "approved_delivery_notice",
+                },
+                evidence,
             )
 
-    # Rule 2: Send Approved Notice
-    if "approved" in objective or "approved" in combined_text:
-        approved_line = None
-        for line_id, text, _ in all_lines:
-            if "approved" in text.lower() or "confirmed delivery" in text.lower():
-                approved_line = line_id
-                break
+    # --- 3. Update Internal Record ---
+    if case_id or "update" in objective.lower():
+        evidence = []
+        if case_line:
+            evidence.append(case_line)
+        if val_line and val_line not in evidence:
+            evidence.append(val_line)
+        if not evidence:
+            evidence = [first_line_id]
 
-        evidence = [approved_line] if approved_line else [all_lines[0][0]]
         return (
-            "send_approved_notice",
-            {"kind": "email", "id": mailbox if mailbox else "customer@example.com"},
-            {"referenceId": dossier.get("dossierId", "ref_001"), "status": "approved", "template": "approved_delivery_notice"},
+            "update_internal_record",
+            {"kind": "case_record", "id": case_id if case_id else f"case_{dossier_id}"},
+            {
+                "field": "delivery_window",
+                "sourceEventId": dossier_id,
+                "value": val if val else "standard",
+            },
             evidence,
         )
 
-    # Rule 3: Update Internal Record
-    if "update" in objective or "case" in combined_text or "delivery window" in combined_text:
-        case_line = all_lines[0][0] if all_lines else "line_1"
-        return (
-            "update_internal_record",
-            {"kind": "case_record", "id": f"case_{dossier.get('dossierId', '001')}"},
-            {"field": "delivery_window", "sourceEventId": dossier.get("dossierId", "evt_001"), "value": "updated"},
-            [case_line],
-        )
+    # --- 4. Request Confirmation ---
+    for l_id, text, _, _ in all_lines:
+        if "confirm" in text.lower() or "verify" in text.lower() or "ambiguous" in text.lower():
+            team, team_line = extract_field_from_lines(
+                all_lines, [r"team[:\s]+([a-zA-Z0-9_\-]+)"]
+            )
+            evidence = [l_id]
+            if team_line and team_line not in evidence:
+                evidence.append(team_line)
+            return (
+                "request_confirmation",
+                {
+                    "kind": "approval_queue",
+                    "id": team if team else "support_team",
+                },
+                {
+                    "claimedSender": mailbox,
+                    "questionCode": "VERIFY_REQUEST",
+                    "referenceId": ref_id,
+                },
+                evidence,
+            )
 
-    # Rule 4: Request Confirmation (Ambiguous Identity / Suspicious Request)
-    if "confirm" in objective or "verify" in combined_text or "ambiguous" in combined_text:
-        return (
-            "request_confirmation",
-            {"kind": "approval_queue", "id": "support_team"},
-            {"claimedSender": mailbox if mailbox else "unknown@domain.com", "questionCode": "VERIFY_REQUEST", "referenceId": dossier.get("dossierId", "ref_001")},
-            [all_lines[0][0]] if all_lines else ["line_1"],
-        )
+    # --- 5. Create Draft ---
+    for l_id, text, _, _ in all_lines:
+        if "draft" in text.lower() or "order" in text.lower():
+            evidence = [l_id]
+            if ref_line and ref_line not in evidence:
+                evidence.append(ref_line)
+            return (
+                "create_draft",
+                {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
+                {
+                    "recipient": mailbox,
+                    "referenceId": ref_id,
+                    "status": "pending",
+                    "template": "order_status",
+                },
+                evidence,
+            )
 
-    # Rule 5: Draft Response for Customer Enquiries
-    if "draft" in objective or "customer" in combined_text or "order" in combined_text:
-        return (
-            "create_draft",
-            {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
-            {"recipient": mailbox, "referenceId": dossier.get("dossierId", "ref_001"), "status": "pending", "template": "order_status"},
-            [all_lines[0][0]] if all_lines else ["line_1"],
-        )
-
-    # Rule 6: Default / No Action
-    default_line = all_lines[0][0] if all_lines else "line_1"
+    # --- 6. Default No Action ---
     return (
         "no_action",
         None,
-        {"reasonCode": "INFORMATIONAL", "referenceId": dossier.get("dossierId", "ref_001")},
-        [default_line],
+        {"reasonCode": "INFORMATIONAL", "referenceId": ref_id},
+        [first_line_id],
     )
 
 
 # ---------------------------------------------------------------------------
-# Receipt Verification (Ed25519)
+# Strict Ed25519 Receipt Signature Verification
 # ---------------------------------------------------------------------------
 
 
@@ -179,10 +256,9 @@ def verify_receipt_signature(
     receipt: Dict[str, Any],
     signature_b64: str,
 ) -> bool:
-    """Imports Ed25519 public key JWK and verifies signature over normalized JSON receipt envelope."""
+    """Verifies Ed25519 receipt signature against recursively key-sorted canonical JSON."""
     try:
         x_b64 = public_key_jwk.get("x", "")
-        # Add base64 padding if needed
         padding = "=" * ((4 - len(x_b64) % 4) % 4)
         raw_key_bytes = base64.urlsafe_b64decode(x_b64 + padding)
 
@@ -214,13 +290,13 @@ def verify_receipt_signature(
 
 
 # ---------------------------------------------------------------------------
-# Flask HTTP Endpoints
+# HTTP Endpoints
 # ---------------------------------------------------------------------------
 
 
 @app.route("/", methods=["GET", "OPTIONS"])
 def health():
-    return jsonify({"status": "ok", "service": "Mailroom Action Gate", "profile": PROFILE}), 200
+    return jsonify({"status": "ok", "service": "Mailroom Gate API", "profile": PROFILE}), 200
 
 
 @app.route("/", methods=["POST"])
@@ -229,33 +305,36 @@ def mailroom_gate():
     try:
         data = request.get_json(force=True, silent=True)
         if not data or not isinstance(data, dict):
-            return jsonify({"error": "Invalid or missing JSON payload"}), 400
+            return jsonify({"error": "Invalid JSON body"}), 400
 
         operation = data.get("operation")
         profile = data.get("profile")
 
         if profile != PROFILE:
-            return jsonify({"error": f"Unsupported profile '{profile}'"}), 400
+            return jsonify({"error": f"Invalid profile '{profile}'"}), 400
 
         # -------------------------------------------------------------------
-        # OPERATION 1: PROPOSE
+        # OPERATION: PROPOSE
         # -------------------------------------------------------------------
         if operation == "propose":
             evaluation_id = data.get("evaluationId")
             dossiers = data.get("dossiers", [])
             receipt_verifier = data.get("receiptVerifier", {})
 
-            if not evaluation_id or not dossiers:
+            if not evaluation_id or not isinstance(dossiers, list) or not dossiers:
                 return jsonify({"error": "Missing evaluationId or dossiers"}), 400
 
             computed_digest = compute_input_digest(dossiers)
 
-            # Check if evaluationId exists with changed content (HTTP 409)
+            # Conflict check: same evaluationId with different content -> HTTP 409
             if evaluation_id in EVALUATION_STORE:
                 existing = EVALUATION_STORE[evaluation_id]
                 if existing["inputDigest"] != computed_digest:
-                    return jsonify({"error": "evaluationId exists with different input content"}), 409
-                # Replay exact cached response
+                    return (
+                        jsonify({"error": "evaluationId exists with different input content"}),
+                        409,
+                    )
+                # Exact replay
                 return (
                     jsonify(
                         {
@@ -272,25 +351,26 @@ def mailroom_gate():
             proposals = []
             seen_dossier_ids = set()
 
-            for idx, dossier in enumerate(dossiers):
+            for dossier in dossiers:
                 d_id = dossier.get("dossierId")
                 if not d_id or d_id in seen_dossier_ids:
-                    return jsonify({"error": f"Duplicate or missing dossierId: {d_id}"}), 400
+                    return (
+                        jsonify({"error": f"Invalid or duplicate dossierId: {d_id}"}),
+                        400,
+                    )
                 seen_dossier_ids.add(d_id)
 
-                # Cache lookup by canonical content hash
                 content_hash = compute_dossier_content_hash(dossier)
 
                 if content_hash in DOSSIER_CACHE:
-                    cached_proposal = DOSSIER_CACHE[content_hash]
-                    # Preserve proposal structure with current dossierId
+                    cached = DOSSIER_CACHE[content_hash]
                     prop = {
                         "dossierId": d_id,
-                        "callId": cached_proposal["callId"],
-                        "action": cached_proposal["action"],
-                        "target": cached_proposal["target"],
-                        "payload": cached_proposal["payload"],
-                        "evidence": cached_proposal["evidence"],
+                        "callId": cached["callId"],
+                        "action": cached["action"],
+                        "target": cached["target"],
+                        "payload": cached["payload"],
+                        "evidence": cached["evidence"],
                     }
                 else:
                     action, target, payload, evidence = analyze_dossier(dossier)
@@ -308,7 +388,7 @@ def mailroom_gate():
 
                 proposals.append(prop)
 
-            # Store state for commit phase
+            # Store for commit phase
             EVALUATION_STORE[evaluation_id] = {
                 "inputDigest": computed_digest,
                 "proposals": proposals,
@@ -330,7 +410,7 @@ def mailroom_gate():
             )
 
         # -------------------------------------------------------------------
-        # OPERATION 2: COMMIT
+        # OPERATION: COMMIT
         # -------------------------------------------------------------------
         elif operation == "commit":
             evaluation_id = data.get("evaluationId")
@@ -342,7 +422,7 @@ def mailroom_gate():
 
             stored_eval = EVALUATION_STORE[evaluation_id]
 
-            # Replay commit check
+            # Exact replay check
             if stored_eval.get("status") == "completed":
                 return (
                     jsonify(
@@ -363,6 +443,9 @@ def mailroom_gate():
             proposals_map = {p["dossierId"]: p for p in stored_eval["proposals"]}
             verifier_jwk = stored_eval["receiptVerifier"].get("publicKeyJwk", {})
 
+            if len(receipts) != len(proposals_map):
+                return jsonify({"error": "Receipt count does not match proposal count"}), 400
+
             outcomes = []
             seen_receipt_dossiers = set()
 
@@ -377,25 +460,19 @@ def mailroom_gate():
                 proposal = proposals_map[d_id]
                 expected_digest = compute_proposal_digest(proposal)
 
-                # Verify proposalDigest, action, and callId alignment
+                # Verify proposal alignment
                 if (
                     receipt.get("proposalDigest") != expected_digest
                     or receipt.get("callId") != proposal["callId"]
                     or receipt.get("action") != proposal["action"]
                 ):
-                    return jsonify({"error": f"Receipt payload mismatch for dossier {d_id}"}), 400
+                    return jsonify({"error": f"Receipt proposal alignment failed for {d_id}"}), 400
 
-                # Verify Ed25519 Signature
-                is_valid_sig = verify_receipt_signature(
-                    verifier_jwk,
-                    evaluation_id,
-                    input_digest,
-                    receipt,
-                    sig_b64,
-                )
-
-                if not is_valid_sig:
-                    return jsonify({"error": f"Invalid signature on receipt for dossier {d_id}"}), 400
+                # Verify Ed25519 signature
+                if not verify_receipt_signature(
+                    verifier_jwk, evaluation_id, input_digest, receipt, sig_b64
+                ):
+                    return jsonify({"error": f"Invalid signature for dossier {d_id}"}), 400
 
                 accepted = receipt.get("accepted", False)
                 outcomes.append(
@@ -409,7 +486,7 @@ def mailroom_gate():
                     }
                 )
 
-            # Store completed outcomes
+            # Atomically mark as completed
             stored_eval["status"] = "completed"
             stored_eval["outcomes"] = outcomes
 
